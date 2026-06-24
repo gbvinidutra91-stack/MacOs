@@ -1,0 +1,242 @@
+name: macOS Cloud PC — AnyDesk
+
+# Dispara manualmente pelo GitHub Actions
+on:
+  workflow_dispatch:
+
+jobs:
+  cloudpc:
+    name: 🖥️ macOS Cloud PC
+    runs-on: macos-latest
+    # ⚠️  LIMITE REAL do GitHub para runners macOS = 6 horas (360 min)
+    # Definir mais que isso não tem efeito — o job será cancelado mesmo assim
+    timeout-minutes: 360
+
+    steps:
+      # ════════════════════════════════════════════════════════
+      # PASSO 1 — Informações do Sistema
+      # ════════════════════════════════════════════════════════
+      - name: 📊 Informações do Sistema
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  macOS : $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+          echo "  CPU   : $(sysctl -n machdep.cpu.brand_string)"
+          echo "  RAM   : $(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 )) GB"
+          echo "  Arch  : $(uname -m)"
+          echo "  Disco : $(df -h / | tail -1 | awk '{print $4}') disponíveis"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      # ════════════════════════════════════════════════════════
+      # PASSO 2 — Download e Instalação do AnyDesk
+      # ════════════════════════════════════════════════════════
+      - name: 📥 Instalar AnyDesk
+        run: |
+          echo "==> Baixando AnyDesk (com 3 tentativas)..."
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "https://download.anydesk.com/anydesk.dmg" \
+            -o /tmp/anydesk.dmg
+
+          echo "==> Montando imagem de disco..."
+          hdiutil attach /tmp/anydesk.dmg -nobrowse -quiet
+
+          # Detecta dinamicamente o nome do volume (evita falha se o nome mudar)
+          VOLUME=$(ls /Volumes/ | grep -i "anydesk" | head -1)
+          echo "==> Volume detectado: /Volumes/$VOLUME"
+
+          echo "==> Copiando AnyDesk para /Applications..."
+          sudo cp -Rf "/Volumes/$VOLUME/AnyDesk.app" /Applications/
+
+          echo "==> Limpando arquivos temporários..."
+          hdiutil detach "/Volumes/$VOLUME" -quiet 2>/dev/null || true
+          rm -f /tmp/anydesk.dmg
+
+          # Valida instalação
+          ANYDESK_BIN="/Applications/AnyDesk.app/Contents/MacOS/AnyDesk"
+          if [ ! -f "$ANYDESK_BIN" ]; then
+            echo "❌ ERRO: AnyDesk não foi instalado corretamente!"
+            ls -la /Applications/
+            exit 1
+          fi
+
+          ANYDESK_VER=$("$ANYDESK_BIN" --version 2>/dev/null || echo "desconhecida")
+          echo "✅ AnyDesk $ANYDESK_VER instalado com sucesso!"
+
+      # ════════════════════════════════════════════════════════
+      # PASSO 3 — Permissões de Sistema (TCC Database)
+      # ════════════════════════════════════════════════════════
+      - name: 🔓 Configurar Permissões de Sistema
+        run: |
+          # Detecta o Bundle ID real do AnyDesk instalado
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" \
+            "/Applications/AnyDesk.app/Contents/Info.plist" 2>/dev/null \
+            || echo "com.philandro.anydesk")
+          echo "==> Bundle ID: $BUNDLE_ID"
+
+          # Permissões necessárias para acesso remoto completo
+          SERVICES=(
+            "kTCCServiceScreenCapture"
+            "kTCCServiceAccessibility"
+            "kTCCServiceSystemPolicyAllFiles"
+            "kTCCServiceListenEvent"
+            "kTCCServicePostEvent"
+          )
+
+          # Aplica nos bancos TCC do sistema E do usuário atual
+          for DB in \
+            "/Library/Application Support/com.apple.TCC/TCC.db" \
+            "$HOME/Library/Application Support/com.apple.TCC/TCC.db"; do
+
+            if sudo test -f "$DB" 2>/dev/null; then
+              echo "==> Configurando permissões em: $DB"
+              for SVC in "${SERVICES[@]}"; do
+                sudo sqlite3 "$DB" \
+                  "INSERT OR REPLACE INTO access \
+                   (service, client, client_type, auth_value, auth_reason, auth_version, \
+                    indirect_object_identifier) \
+                   VALUES ('$SVC','$BUNDLE_ID',0,2,4,1,'UNUSED');" 2>/dev/null || true
+              done
+              echo "==> ✅ Permissões aplicadas em: $DB"
+            else
+              echo "==> Banco não encontrado (pulando): $DB"
+            fi
+          done
+
+          # Recarrega o daemon de privacidade para reconhecer as novas permissões
+          sudo pkill -f tccd 2>/dev/null || true
+          sleep 2
+
+          echo "✅ Permissões de sistema configuradas!"
+
+      # ════════════════════════════════════════════════════════
+      # PASSO 4 — Configurar e Iniciar o AnyDesk
+      # ════════════════════════════════════════════════════════
+      - name: 🔐 Iniciar e Configurar AnyDesk
+        run: |
+          ANYDESK="/Applications/AnyDesk.app/Contents/MacOS/AnyDesk"
+
+          # Cria diretório de configuração
+          mkdir -p ~/.anydesk
+
+          # Arquivo de config para acesso não supervisionado (sem indentação!)
+          cat > ~/.anydesk/user.conf << 'EOF'
+ad.security.allow_logon_token=true
+ad.features.unattended=true
+ad.roster.never_ask_register=true
+EOF
+
+          echo "==> Arquivo de configuração criado."
+
+          # CORRIGIDO: sem caracteres especiais (!@#$%^&) que causam erros no shell
+          ANYDESK_PASS=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)
+
+          echo "==> Iniciando AnyDesk como serviço do sistema..."
+          sudo "$ANYDESK" --service &
+          sleep 20
+
+          # Verifica se o processo está rodando; reinicia se necessário
+          if ! pgrep -f "AnyDesk" > /dev/null 2>&1; then
+            echo "==> ⚠️  Serviço não detectado. Tentando novamente..."
+            sudo "$ANYDESK" --service &
+            sleep 15
+          fi
+
+          echo "==> Definindo senha de acesso remoto..."
+          echo "$ANYDESK_PASS" | sudo "$ANYDESK" --set-password
+          sleep 5
+
+          # ── Obtém o ID com 3 métodos e 36 tentativas (até 6 minutos) ──
+          echo "==> Buscando ID do AnyDesk (aguarda até 6 min)..."
+          ANYDESK_ID=""
+          RETRIES=0
+
+          while [ -z "$ANYDESK_ID" ] && [ "$RETRIES" -lt 36 ]; do
+
+            # Método 1: --get-id como root (serviço em modo sistema)
+            ANYDESK_ID=$(sudo "$ANYDESK" --get-id 2>/dev/null || true)
+
+            # Método 2: --get-id como usuário normal
+            if [ -z "$ANYDESK_ID" ]; then
+              ANYDESK_ID=$("$ANYDESK" --get-id 2>/dev/null || true)
+            fi
+
+            # Método 3: lê diretamente do arquivo de configuração gerado pelo AnyDesk
+            if [ -z "$ANYDESK_ID" ]; then
+              ANYDESK_ID=$(grep -oE 'ad\.desk\.id=[0-9]+' ~/.anydesk/user.conf 2>/dev/null \
+                           | cut -d= -f2 || true)
+            fi
+
+            # Extrai apenas dígitos (o ID do AnyDesk tem 9-12 dígitos)
+            ANYDESK_ID=$(echo "$ANYDESK_ID" | grep -oE '[0-9]{6,15}' | head -1)
+
+            if [ -z "$ANYDESK_ID" ]; then
+              RETRIES=$((RETRIES + 1))
+              echo "[${RETRIES}/36] Aguardando registro no servidor AnyDesk... (${RETRIES}x10s)"
+              sleep 10
+            fi
+          done
+
+          # Exporta para as próximas etapas do workflow
+          {
+            echo "ANYDESK_ID=${ANYDESK_ID}"
+            echo "ANYDESK_PASS=${ANYDESK_PASS}"
+          } >> "$GITHUB_ENV"
+
+          # ── Banner de conexão ──
+          echo ""
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║         🖥️   macOS Cloud PC — AnyDesk            ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║                                                  ║"
+          echo "║   🔑  AnyDesk ID : ${ANYDESK_ID:-Não obtido (verifique logs)}"
+          echo "║   🔒  Senha       : $ANYDESK_PASS"
+          echo "║                                                  ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║   📱  Como acessar:                              ║"
+          echo "║    1. Abra o AnyDesk no seu dispositivo          ║"
+          echo "║    2. Digite o ID acima e clique em Conectar     ║"
+          echo "║    3. Insira a senha quando solicitada           ║"
+          echo "║                                                  ║"
+          echo "║   ✅  Windows · macOS · iOS · Android            ║"
+          echo "╚══════════════════════════════════════════════════╝"
+
+      # ════════════════════════════════════════════════════════
+      # PASSO 5 — Monitor e Keep-Alive (mantém ativo até 6h)
+      # ════════════════════════════════════════════════════════
+      - name: 🔄 Monitor e Keep-Alive
+        run: |
+          ANYDESK="/Applications/AnyDesk.app/Contents/MacOS/AnyDesk"
+          START=$(date +%s)
+          LAST_LOG=$(date +%s)
+
+          # Exibe banner novamente para quem abre os logs aqui
+          echo ""
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║         🖥️   macOS Cloud PC — AnyDesk            ║"
+          echo "╠══════════════════════════════════════════════════╣"
+          echo "║   🔑  ID    : $ANYDESK_ID"
+          echo "║   🔒  Senha : $ANYDESK_PASS"
+          echo "╚══════════════════════════════════════════════════╝"
+          echo ""
+
+          # Loop de monitoramento: verifica a cada 5 min, log a cada 30 min
+          while true; do
+            NOW=$(date +%s)
+            ELAPSED_MIN=$(( (NOW - START) / 60 ))
+
+            # ── Reinicia o AnyDesk se tiver parado ──
+            if ! pgrep -f "AnyDesk" > /dev/null 2>&1; then
+              echo "[$(date +'%H:%M:%S')] ⚠️  AnyDesk parou! Reiniciando..."
+              sudo "$ANYDESK" --service &
+              sleep 15
+              echo "$ANYDESK_PASS" | sudo "$ANYDESK" --set-password
+              echo "[$(date +'%H:%M:%S')] ✅ AnyDesk reiniciado com sucesso!"
+            fi
+
+            # ── Log de status a cada 30 minutos ──
+            if [ $(( NOW - LAST_LOG )) -ge 1800 ]; then
+              echo "[$(date +'%H:%M:%S')] 📊 Status: Ativo · ID: $ANYDESK_ID · ${ELAPSED_MIN}min rodando"
+              LAST_LOG=$NOW
+            fi
+
+            sleep 300  # Verifica a cada 5 minutos
+          done
